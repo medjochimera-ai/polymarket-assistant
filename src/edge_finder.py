@@ -217,11 +217,23 @@ class EdgeLedger:
                 continue
         return resolved
 
-    def summary(self) -> dict:
+    @staticmethod
+    def _tf_filter(timeframe: Optional[str]) -> tuple[str, tuple]:
+        return (" AND timeframe = ?", (timeframe,)) if timeframe else ("", ())
+
+    def timeframes(self) -> list[str]:
+        """Timeframes with at least one resolved forecast, shortest first."""
+        with self._connect() as db:
+            rows = db.execute("""SELECT DISTINCT timeframe, horizon_bucket_seconds FROM forecasts
+                       WHERE outcome_up IS NOT NULL ORDER BY horizon_bucket_seconds""").fetchall()
+        return list(dict.fromkeys(r["timeframe"] for r in rows))
+
+    def summary(self, timeframe: Optional[str] = None) -> dict:
+        tf_sql, tf_args = self._tf_filter(timeframe)
         with self._connect() as db:
             rows = db.execute("""SELECT horizon_bucket, horizon_bucket_seconds,
                        p_up, market_p_up, outcome_up, up_ask, down_ask, up_net_edge, down_net_edge
-                FROM forecasts WHERE outcome_up IS NOT NULL""").fetchall()
+                FROM forecasts WHERE outcome_up IS NOT NULL""" + tf_sql, tf_args).fetchall()
         if not rows:
             return {"n": 0, "brier_model": None, "brier_market": None,
                     "candidate_n": 0, "candidate_pnl": None, "bucket_seconds": None}
@@ -235,7 +247,8 @@ class EdgeLedger:
         with self._connect() as db:
             all_rows = db.execute("""SELECT market_slug, captured_ts, up_entry_cost, down_entry_cost,
                               up_net_edge, down_net_edge, outcome_up
-                       FROM forecasts WHERE outcome_up IS NOT NULL ORDER BY captured_ts""").fetchall()
+                       FROM forecasts WHERE outcome_up IS NOT NULL""" + tf_sql
+                       + " ORDER BY captured_ts", tf_args).fetchall()
         chosen, seen = [], set()
         for r in all_rows:
             slug = r["market_slug"]
@@ -257,12 +270,13 @@ class EdgeLedger:
                 "candidate_n": len(chosen), "candidate_pnl": candidate_pnl if chosen else None,
                 "bucket_seconds": rows[0]["horizon_bucket_seconds"]}
 
-    def horizon_scores(self) -> list[dict]:
+    def horizon_scores(self, timeframe: Optional[str] = None) -> list[dict]:
+        tf_sql, tf_args = self._tf_filter(timeframe)
         with self._connect() as db:
             rows = db.execute("""SELECT horizon_bucket, horizon_bucket_seconds,
                               p_up, market_p_up, outcome_up
-                       FROM forecasts WHERE outcome_up IS NOT NULL
-                       ORDER BY horizon_bucket DESC""").fetchall()
+                       FROM forecasts WHERE outcome_up IS NOT NULL""" + tf_sql
+                       + " ORDER BY horizon_bucket DESC", tf_args).fetchall()
         grouped = {}
         for row in rows:
             key = (row["horizon_bucket"], row["horizon_bucket_seconds"])
@@ -289,12 +303,12 @@ async def run_recorder(state, coin: str, timeframe: str):
             now = time.time()
             if now - last_summary >= 30:
                 await asyncio.to_thread(ledger.resolve_pending)
-                summary = await asyncio.to_thread(ledger.summary)
+                summary = await asyncio.to_thread(ledger.summary, timeframe)
                 if summary["n"]:
                     model = f"{summary['brier_model']:.3f}"
                     market = "—" if summary["brier_market"] is None else f"{summary['brier_market']:.3f}"
                     pnl = "—" if summary["candidate_pnl"] is None else f"${summary['candidate_pnl']:+.3f} total"
-                    state.edge_summary = (f"Brier model {model} vs market {market} (n={summary['n']}); "
+                    state.edge_summary = (f"{timeframe} Brier model {model} vs market {market} (n={summary['n']}); "
                                           f"first-signal hold proxy {pnl} across {summary['candidate_n']} "
                                           f"{config.EDGE_PROBE_SHARES:g}-share entries")
                 else:
