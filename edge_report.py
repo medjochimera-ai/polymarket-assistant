@@ -12,6 +12,18 @@ def print_timeframe(ledger, timeframe):
     summary = ledger.summary(timeframe)
     print(f"\n══ {timeframe} markets (bucket width {summary['bucket_seconds']}s) ══")
     print(f"Forecasts: {summary['n']}")
+    feed = summary["feed"]
+    parts = [f"{label} {feed[key]['n']} (Brier {feed[key]['brier_model']:.4f})"
+             for key, label in (("live", "live"), ("stale", "blocked stale-price"),
+                                ("legacy", "pre-check legacy")) if key in feed]
+    print("Feed check: " + " · ".join(parts))
+    if "stale" in feed:
+        print("  Blocked stale-price rows are excluded from every score below.")
+    if "legacy" in feed:
+        print("  Legacy rows predate the staleness check and may include frozen-price periods.")
+    if not summary["n"]:
+        print("  No live resolved forecasts to score yet.")
+        return
     print(f"Overall Brier: model {summary['brier_model']:.4f} | "
           f"market midpoint {summary['brier_market']:.4f}" if summary["brier_market"] is not None
           else f"Overall Brier: model {summary['brier_model']:.4f} | market midpoint unavailable")

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+from collections import deque
 
 import requests
 import websockets
@@ -32,8 +33,12 @@ class State:
         self.win_start: float | None = None    # unix ts
         self.win_end:   float | None = None
         self.price_to_beat: float | None = None
-        self.ptb_source: str | None = None     # "polymarket" | "binance≈"
+        self.ptb_source: str | None = None     # "polymarket TWAP" | "chainlink TWAP*" | "polymarket" | "binance≈"
+        self.ptb_provisional: bool = False     # own TWAP in use until the official one is published
+        self.ptb_next_try: float = 0.0
         self.chainlink:  float | None = None   # live Chainlink price (5m/15m/4h settle on this)
+        self.chainlink_rcv: float | None = None  # local receive time of the last live tick
+        self.cl_ticks: deque = deque(maxlen=900)  # (source ts seconds, value), live + backfill
         self.resolves_on: str = "chainlink"
         self.edge_summary: str = "collecting forecasts"
 
@@ -41,6 +46,18 @@ class State:
     def ref_price(self):
         """Live price in the same terms the market settles on."""
         return self.chainlink if self.resolves_on == "chainlink" else self.mid
+
+    @property
+    def ref_age(self) -> float | None:
+        """Seconds since the settlement-source price last updated (None if never)."""
+        if self.resolves_on != "chainlink":
+            return 0.0
+        return None if self.chainlink_rcv is None else time.time() - self.chainlink_rcv
+
+    @property
+    def ref_stale(self) -> bool:
+        age = self.ref_age
+        return age is None or age > config.CL_STALE_SECS
 
     def _pm_side(self, asset, key):
         return (self.pm_book.get(asset) or {}).get(key) if asset else None
@@ -261,15 +278,36 @@ def _iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _fetch_pm_price_to_beat(coin: str, tf: str, start: float, end: float) -> float | None:
+def _fetch_pm_price_to_beat(coin: str, tf: str, start: float, end: float,
+                            twap: bool = False) -> float | None:
+    params = {"symbol": coin, "eventStartTime": _iso(start),
+              "variant": config.PM_VARIANT[tf], "endDate": _iso(end)}
+    if twap:
+        # Chainlink markets settle on 60 s trailing TWAPs; the plain openPrice is a spot tick.
+        params.update(twapEnabled="true", twapLookbackSeconds=config.SETTLE_TWAP_SECS)
     try:
-        r = _get_json(config.PM_CRYPTO_PRICE,
-                      {"symbol": coin, "eventStartTime": _iso(start),
-                       "variant": config.PM_VARIANT[tf], "endDate": _iso(end)})
+        r = _get_json(config.PM_CRYPTO_PRICE, params)
         v = r.get("openPrice")
         return float(v) if v else None
     except Exception:
         return None
+
+
+def chainlink_twap(ticks, end: float, lookback: int = config.SETTLE_TWAP_SECS) -> float | None:
+    """Time-weighted average of Chainlink ticks over [end - lookback, end), sampled each second."""
+    pts = sorted(t for t in ticks if t[0] < end)
+    if not pts or pts[0][0] > end - lookback + 5 or pts[-1][0] < end - 5:
+        return None   # not enough coverage of the lookback window
+    total, i, last = 0.0, 0, None
+    for k in range(lookback):
+        t = end - lookback + k
+        while i < len(pts) and pts[i][0] <= t:
+            last = pts[i][1]
+            i += 1
+        if last is None:
+            return None
+        total += last
+    return total / lookback
 
 
 def _fetch_open_price(symbol: str, ts: float) -> float | None:
@@ -300,13 +338,26 @@ async def market_manager(coin: str, tf: str, symbol: str, state: State):
                 state.win_end   = mkt["end"]
                 state.pm_book   = {}
                 state.price_to_beat = None
+                state.ptb_provisional = False
+                state.ptb_next_try = 0.0
                 state.pm_gen   += 1
-        if (state.price_to_beat is None and state.win_start
-                and time.time() >= state.win_start + 1):
+        now = time.time()
+        if ((state.price_to_beat is None or state.ptb_provisional) and state.win_start
+                and now >= state.win_start + 1 and now >= state.ptb_next_try):
+            chainlink = state.resolves_on == "chainlink"
+            state.ptb_next_try = now + (5 if chainlink else 1)
             ptb = await asyncio.to_thread(_fetch_pm_price_to_beat, coin, tf,
-                                          state.win_start, state.win_end)
+                                          state.win_start, state.win_end, chainlink)
             if ptb:
-                state.price_to_beat, state.ptb_source = ptb, "polymarket"
+                state.price_to_beat = ptb
+                state.ptb_source = "polymarket TWAP" if chainlink else "polymarket"
+                state.ptb_provisional = False
+            elif chainlink and state.price_to_beat is None:
+                # Official TWAP open is often published late: use our own until it appears.
+                ptb = chainlink_twap(state.cl_ticks, state.win_start)
+                if ptb:
+                    state.price_to_beat, state.ptb_source = ptb, "chainlink TWAP*"
+                    state.ptb_provisional = True
             elif state.resolves_on == "binance":
                 ptb = await asyncio.to_thread(_fetch_open_price, symbol, state.win_start)
                 if ptb:
@@ -315,25 +366,56 @@ async def market_manager(coin: str, tf: str, symbol: str, state: State):
 
 
 async def chainlink_feed(coin: str, state: State):
+    """Live Chainlink price via Polymarket RTDS.
+
+    The socket can stay open while ticks for our symbol silently stop, so liveness is
+    tracked per symbol and a stalled connection is replaced with a fresh one.
+    """
     sym = f"{config.COIN_PM[coin]}/usd"
+    # filters is a JSON string and must be compact: '{"symbol": "btc/usd"}' matches nothing.
     sub = {"action": "subscribe",
-           "subscriptions": [{"topic": "crypto_prices_chainlink", "type": "*", "filters": ""}]}
+           "subscriptions": [{"topic": "crypto_prices_chainlink", "type": "*",
+                              "filters": json.dumps({"symbol": sym}, separators=(",", ":"))}]}
     while True:
         try:
             async with websockets.connect(config.PM_RTDS, ping_interval=20,
                                           ping_timeout=60, close_timeout=10) as ws:
                 await ws.send(json.dumps(sub))
-                async for raw in ws:
+                connected = last_ping = time.time()
+                last_tick = None
+                while True:
+                    now = time.time()
+                    if now - max(last_tick or 0.0, connected) > config.CL_RECONNECT_SECS:
+                        raise TimeoutError(f"no {sym} tick for {config.CL_RECONNECT_SECS:g}s")
+                    if now - last_ping >= 5:
+                        await ws.send("PING")
+                        last_ping = now
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), 1)
+                    except asyncio.TimeoutError:
+                        continue
+                    if not raw or not raw.startswith("{"):
+                        continue   # PONG / keep-alives
                     try:
                         msg = json.loads(raw)
                     except ValueError:
                         continue
                     pay = msg.get("payload") or {}
-                    if pay.get("symbol") == sym and pay.get("value"):
+                    if pay.get("symbol") != sym:
+                        continue
+                    if isinstance(pay.get("data"), list):
+                        # subscribe backfill: seeds the TWAP buffer, not a live tick
+                        for p in pay["data"]:
+                            if p.get("value"):
+                                state.cl_ticks.append((p["timestamp"] / 1000, float(p["value"])))
+                    elif pay.get("value"):
+                        ts = (pay.get("timestamp") or now * 1000) / 1000
                         state.chainlink = float(pay["value"])
+                        state.chainlink_rcv = last_tick = time.time()
+                        state.cl_ticks.append((ts, state.chainlink))
         except Exception as e:
-            print(f"  [Chainlink] connection error: {e}, reconnecting in 5s...")
-            await asyncio.sleep(5)
+            print(f"  [Chainlink] {e}, reconnecting...")
+            await asyncio.sleep(1)
 
 
 async def pm_feed(state: State):

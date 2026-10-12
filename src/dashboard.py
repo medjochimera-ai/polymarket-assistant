@@ -378,7 +378,13 @@ def _market_panel(st, timeframe):
 
     ptb, ref = st.price_to_beat, st.ref_price
     src = "Chainlink" if st.resolves_on == "chainlink" else "Binance"
-    t.add_row("Live price", _p(ref) if ref else "[dim]—[/dim]", f"[dim]{src} · settlement source[/dim]")
+    age = st.ref_age
+    if st.ref_stale:
+        stale = "no tick yet" if age is None else f"{age:.0f}s old"
+        t.add_row("Live price", _p(ref) if ref else "[dim]—[/dim]",
+                  f"[red bold]STALE · {stale} · signals blocked[/red bold]")
+    else:
+        t.add_row("Live price", _p(ref) if ref else "[dim]—[/dim]", f"[dim]{src} · settlement source[/dim]")
     if ptb and ref:
         d   = ref - ptb
         c   = "green" if d >= 0 else "red"

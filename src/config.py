@@ -86,6 +86,9 @@ EDGE_SLIPPAGE_BUFFER = float(os.getenv("EDGE_SLIPPAGE_BUFFER", "0.005"))
 EDGE_MIN_NET = float(os.getenv("EDGE_MIN_NET", "0.03"))
 EDGE_PROBE_SHARES = float(os.getenv("EDGE_PROBE_SHARES", "5"))
 EDGE_MAX_WALK = float(os.getenv("EDGE_MAX_WALK", "0.02"))
+CL_STALE_SECS = float(os.getenv("CL_STALE_SECS", "5"))          # block signals when the price is older
+CL_RECONNECT_SECS = float(os.getenv("CL_RECONNECT_SECS", "8"))  # fresh RTDS socket after this silence
+SETTLE_TWAP_SECS = 60   # Chainlink markets settle on 60 s trailing TWAPs at window start / end
 EDGE_DB_PATH = os.getenv("EDGE_DB_PATH", str(Path(__file__).resolve().parents[1] / "edge_research.db"))
 
 # ── Dashboard ──────────────────────────────────────────────────

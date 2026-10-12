@@ -74,6 +74,8 @@ def estimate(state, timeframe: str) -> dict:
     down_vwap, down_cost, down_levels = _entry(down_book)
     result = {
         "seconds_left": left,
+        "ref_age": state.ref_age,
+        "ref_stale": state.ref_stale,
         "p_up": p_up,
         "sigma_per_sqrt_second": sigma,
         "up_bid": state.pm_up_bid,
@@ -99,7 +101,8 @@ def estimate(state, timeframe: str) -> dict:
         if bid is not None and ask is not None:
             result[f"{side}_spread"] = ask - bid
         entry_cost = result[f"{side}_entry_cost"]
-        if probability is not None and entry_cost is not None:
+        # No signal off a stale settlement price: the model would compare an old price to a fresh strike.
+        if probability is not None and entry_cost is not None and not result["ref_stale"]:
             result[f"{side}_edge"] = probability - entry_cost
     return result
 
@@ -140,7 +143,9 @@ class EdgeLedger:
             columns = {row[1] for row in db.execute("PRAGMA table_info(forecasts)")}
             for name, kind in (("up_probe_vwap", "REAL"), ("down_probe_vwap", "REAL"),
                                ("up_entry_cost", "REAL"), ("down_entry_cost", "REAL"),
-                               ("up_book_json", "TEXT"), ("down_book_json", "TEXT")):
+                               ("up_book_json", "TEXT"), ("down_book_json", "TEXT"),
+                               ("ref_age_seconds", "REAL"), ("ref_stale", "INTEGER"),
+                               ("ptb_source", "TEXT")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE forecasts ADD COLUMN {name} {kind}")
             db.execute("CREATE INDEX IF NOT EXISTS forecasts_unresolved ON forecasts(outcome_up, captured_ts)")
@@ -155,21 +160,27 @@ class EdgeLedger:
         bucket = int(e["seconds_left"] // bucket_seconds)
         bid, ask = e["up_bid"], e["up_ask"]
         market_p = (bid + ask) / 2 if bid is not None and ask is not None else None
+        stale = 1 if e["ref_stale"] else 0
         with self._connect() as db:
+            if not stale:
+                # A live forecast replaces a stale-flagged one already holding this bucket.
+                db.execute("""DELETE FROM forecasts WHERE market_slug = ? AND horizon_bucket = ?
+                              AND ref_stale = 1 AND outcome_up IS NULL""", (state.pm_slug, bucket))
             cur = db.execute("""INSERT OR IGNORE INTO forecasts (
                 market_slug, coin, timeframe, horizon_bucket, horizon_bucket_seconds,
                 captured_ts, ref_price, price_to_beat, sigma_per_sqrt_second,
                 p_up, market_p_up, up_bid, up_ask, down_bid, down_ask,
                 up_probe_vwap, down_probe_vwap, up_entry_cost, down_entry_cost,
-                up_book_json, down_book_json, up_net_edge, down_net_edge
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                up_book_json, down_book_json, up_net_edge, down_net_edge,
+                ref_age_seconds, ref_stale, ptb_source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (state.pm_slug, coin, timeframe, bucket, bucket_seconds, time.time(),
                  state.ref_price, state.price_to_beat, e["sigma_per_sqrt_second"],
                  e["p_up"], market_p, e["up_bid"], e["up_ask"], e["down_bid"], e["down_ask"],
                  e["up_probe_vwap"], e["down_probe_vwap"], e["up_entry_cost"], e["down_entry_cost"],
                  json.dumps(e["up_book"]) if e["up_book"] is not None else None,
                  json.dumps(e["down_book"]) if e["down_book"] is not None else None,
-                 e["up_edge"], e["down_edge"]))
+                 e["up_edge"], e["down_edge"], e["ref_age"], stale, state.ptb_source))
             return cur.rowcount > 0
 
     @staticmethod
@@ -233,9 +244,10 @@ class EdgeLedger:
         with self._connect() as db:
             rows = db.execute("""SELECT horizon_bucket, horizon_bucket_seconds,
                        p_up, market_p_up, outcome_up, up_ask, down_ask, up_net_edge, down_net_edge
-                FROM forecasts WHERE outcome_up IS NOT NULL""" + tf_sql, tf_args).fetchall()
+                FROM forecasts WHERE outcome_up IS NOT NULL AND ref_stale IS NOT 1""" + tf_sql, tf_args).fetchall()
+        feed = self._feed_check(tf_sql, tf_args)
         if not rows:
-            return {"n": 0, "brier_model": None, "brier_market": None,
+            return {"n": 0, "brier_model": None, "brier_market": None, "feed": feed,
                     "candidate_n": 0, "candidate_pnl": None, "bucket_seconds": None}
         model_brier = sum((r["p_up"] - r["outcome_up"]) ** 2 for r in rows) / len(rows)
         market_rows = [r for r in rows if r["market_p_up"] is not None]
@@ -247,7 +259,7 @@ class EdgeLedger:
         with self._connect() as db:
             all_rows = db.execute("""SELECT market_slug, captured_ts, up_entry_cost, down_entry_cost,
                               up_net_edge, down_net_edge, outcome_up
-                       FROM forecasts WHERE outcome_up IS NOT NULL""" + tf_sql
+                       FROM forecasts WHERE outcome_up IS NOT NULL AND ref_stale IS NOT 1""" + tf_sql
                        + " ORDER BY captured_ts", tf_args).fetchall()
         chosen, seen = [], set()
         for r in all_rows:
@@ -266,16 +278,26 @@ class EdgeLedger:
         candidate_pnl = 0.0
         for win, entry_cost, _ in chosen:
             candidate_pnl += (win - entry_cost) * config.EDGE_PROBE_SHARES
-        return {"n": len(rows), "brier_model": model_brier, "brier_market": market_brier,
+        return {"n": len(rows), "brier_model": model_brier, "brier_market": market_brier, "feed": feed,
                 "candidate_n": len(chosen), "candidate_pnl": candidate_pnl if chosen else None,
                 "bucket_seconds": rows[0]["horizon_bucket_seconds"]}
+
+    def _feed_check(self, tf_sql: str, tf_args: tuple) -> dict:
+        """Resolved rows by settlement-price status: live, blocked (stale), legacy (pre-check)."""
+        with self._connect() as db:
+            rows = db.execute("""SELECT CASE ref_stale WHEN 0 THEN 'live' WHEN 1 THEN 'stale'
+                                        ELSE 'legacy' END status, count(*) n,
+                                 avg((p_up - outcome_up) * (p_up - outcome_up)) brier
+                          FROM forecasts WHERE outcome_up IS NOT NULL""" + tf_sql
+                              + " GROUP BY 1", tf_args).fetchall()
+        return {r["status"]: {"n": r["n"], "brier_model": r["brier"]} for r in rows}
 
     def horizon_scores(self, timeframe: Optional[str] = None) -> list[dict]:
         tf_sql, tf_args = self._tf_filter(timeframe)
         with self._connect() as db:
             rows = db.execute("""SELECT horizon_bucket, horizon_bucket_seconds,
                               p_up, market_p_up, outcome_up
-                       FROM forecasts WHERE outcome_up IS NOT NULL""" + tf_sql
+                       FROM forecasts WHERE outcome_up IS NOT NULL AND ref_stale IS NOT 1""" + tf_sql
                        + " ORDER BY horizon_bucket DESC", tf_args).fetchall()
         grouped = {}
         for row in rows:
